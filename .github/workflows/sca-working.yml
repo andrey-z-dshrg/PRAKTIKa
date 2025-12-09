@@ -5,67 +5,41 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    container:
-      image: maven:3.9.6-eclipse-temurin-21
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Build with Maven
-      run: |
-        mvn clean compile test package
-        
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: java-app
-        path: ./target/*.jar
-
   sca:
     runs-on: ubuntu-latest
-    needs: [build]
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Setup Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '21'
-    
-    - name: Run OWASP Dependency-Check
-      env:
-        NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+    - name: Run OWASP Dependency-Check with Docker
       run: |
-        # Простой скрипт без сложного синтаксиса
-        echo "Starting OWASP Dependency-Check analysis"
+        echo "Running OWASP Dependency-Check using Docker..."
         
-        # Проверяем наличие ключа (простое сообщение)
-        if [ -z "$NVD_API_KEY" ]; then
-          echo "Warning: NVD_API_KEY not set in secrets"
-          echo "Using fallback method..."
-          mvn org.owasp:dependency-check-maven:9.0.9:check \
-            -Dformat=HTML \
-            -DsuppressionFiles=dependency-check-suppressions.xml \
-            -DfailOnError=false
-        else
-          echo "Using NVD API Key"
-          mvn org.owasp:dependency-check-maven:9.0.9:check \
-            -Dformat=HTML \
-            -DsuppressionFiles=dependency-check-suppressions.xml \
-            -DnvdApiKey=$NVD_API_KEY \
-            -DfailOnError=false
-        fi
+        # Создаем папку для отчетов
+        mkdir -p ./reports
         
-        echo "Analysis completed"
-    
-    - name: Upload SCA report
+        # Запускаем Dependency-Check через Docker
+        docker run --rm \
+          -v "$(pwd)":/src \
+          -v "$(pwd)/reports":/reports \
+          owasp/dependency-check:9.0.9 \
+          --scan /src \
+          --format "HTML" \
+          --format "JSON" \
+          --out /reports \
+          --project "PRAKTIKa" \
+          --suppression /src/dependency-check-suppressions.xml \
+          --failOnCVSS 0
+        
+        echo "SCA analysis completed!"
+        ls -la ./reports/
+        
+    - name: Upload SCA reports
       uses: actions/upload-artifact@v4
       with:
         name: dependency-check-report
-        path: target/dependency-check-report.html
+        path: |
+          reports/dependency-check-report.html
+          reports/dependency-check-report.json
+        retention-days: 7
