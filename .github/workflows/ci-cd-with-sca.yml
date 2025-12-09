@@ -35,49 +35,56 @@ jobs:
         path: ./target/*.jar
 
   sca:
-    runs-on: ubuntu-latest
-    needs: [build]  # Запускается после сборки
-    container:
-      image: maven:3.9.6-eclipse-temurin-21
+  runs-on: ubuntu-latest
+  needs: [build]  # Запускается после сборки
+  container:
+    image: maven:3.9.6-eclipse-temurin-21
+  
+  steps:
+  - name: Checkout code
+    uses: actions/checkout@v4
     
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+  - name: Cache OWASP Dependency-Check database
+    uses: actions/cache@v3
+    with:
+      path: |
+        ~/.m2/repository/org/owasp/dependency-check-data
+        ~/.dependency-check
+      key: ${{ runner.os }}-dep-check-${{ hashFiles('pom.xml') }}
+      restore-keys: |
+        ${{ runner.os }}-dep-check-
+  
+  - name: Run OWASP Dependency-Check with NVD API Key
+    env:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+    run: |
+      echo "Running OWASP Dependency-Check SCA analysis with NVD API Key..."
       
-    - name: Cache OWASP Dependency-Check database
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.m2/repository/org/owasp/dependency-check-data
-          ~/.dependency-check
-        key: ${{ runner.os }}-dep-check-${{ hashFiles('pom.xml') }}
-        restore-keys: |
-          ${{ runner.os }}-dep-check-
+      # Безопасная проверка наличия API ключа
+      if [ -z "$NVD_API_KEY" ]; then
+        echo "ERROR: NVD_API_KEY is not set!"
+        exit 1
+      fi
       
-    - name: Run OWASP Dependency-Check with NVD API Key
-      env:
-        NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-      run: |
-        echo "Running OWASP Dependency-Check SCA analysis with NVD API Key..."
-        echo "NVD API Key: ${NVD_API_KEY:0:8}..."  # Показываем только первые 8 символов
-        
-        # Запускаем проверку с API ключом
-        mvn org.owasp:dependency-check-maven:check \
-          -Dformat=HTML \
-          -DfailBuildOnCVSS=8 \
-          -DsuppressionFiles=dependency-check-suppressions.xml \
-          -DnvdApiKey=$NVD_API_KEY \
-          -DnvdApiDelay=6500 \
-          -DfailOnError=false
-        
-        echo "SCA analysis completed!"
-        
-    - name: Upload SCA report artifact
-      if: always()  # Загружаем даже при ошибке
-      uses: actions/upload-artifact@v4
-      with:
-        name: dependency-check-report
-        path: |
-          target/dependency-check-report.html
-          target/dependency-check-report.json
-        retention-days: 7
+      echo "NVD API Key is set (first 8 chars): ${NVD_API_KEY:0:8}..."
+      
+      # Запускаем проверку с API ключом
+      mvn org.owasp:dependency-check-maven:check \
+        -Dformat=HTML \
+        -DfailBuildOnCVSS=8 \
+        -DsuppressionFiles=dependency-check-suppressions.xml \
+        -DnvdApiKey=$NVD_API_KEY \
+        -DnvdApiDelay=6500 \
+        -DfailOnError=false
+      
+      echo "SCA analysis completed!"
+  
+  - name: Upload SCA report artifact
+    if: always()  # Загружаем даже при ошибке
+    uses: actions/upload-artifact@v4
+    with:
+      name: dependency-check-report
+      path: |
+        target/dependency-check-report.html
+        target/dependency-check-report.json
+      retention-days: 7
