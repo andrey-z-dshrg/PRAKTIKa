@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+    <!-- Примеры исключений ложных срабатываний -->
+    
+    <!-- Исключение для тестовых зависимостей -->
+    <suppress>
+        <notes><![CDATA[Исключить тестовые зависимости]]></notes>
+        <gav regex="true">.*:.*:test.*</gav>
+        <cve>.*</cve>
+    </suppress>
+    
+    <!-- Исключение для конкретной библиотеки (пример) -->
+    <!--
+    <suppress>
+        <notes><![CDATA[Ложное срабатывание для библиотеки example]]></notes>
+        <gav regex="true">^com\.example:library:1\.0\.0$</gav>
+        <cve>CVE-2023-XXXXX</cve>
+    </suppress>
+    -->
+    
+    <!-- Добавляйте реальные исключения после анализа отчета -->
+</suppressions>
