@@ -1,4 +1,4 @@
-name: Java CI/CD with SCA
+name: Java CI/CD with SCA (NVD API)
 
 on:
   pull_request:
@@ -35,46 +35,49 @@ jobs:
         path: ./target/*.jar
 
   sca:
-  runs-on: ubuntu-latest
-  needs: [build]
-  container:
-    image: maven:3.9.6-eclipse-temurin-21
-  
-  steps:
-  - name: Checkout code
-    uses: actions/checkout@v4
+    runs-on: ubuntu-latest
+    needs: [build]  # Запускается после сборки
+    container:
+      image: maven:3.9.6-eclipse-temurin-21
     
-  - name: Run OWASP Dependency-Check SCA
-    run: |
-      echo "Running OWASP Dependency-Check SCA analysis..."
-      # Сначала скачиваем плагин и зависимости
-      mvn dependency:resolve-plugins
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
       
-      # Запускаем проверку с более простыми параметрами
-      mvn org.owasp:dependency-check-maven:check \
-        -Dformat=HTML \
-        -DfailBuildOnCVSS=11 \
-        -DsuppressionFile=dependency-check-suppressions.xml || true
+    - name: Cache OWASP Dependency-Check database
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.m2/repository/org/owasp/dependency-check-data
+          ~/.dependency-check
+        key: ${{ runner.os }}-dep-check-${{ hashFiles('pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-dep-check-
       
-      echo "SCA analysis completed (ignoring exit code for now)"
-      
-  - name: Check for report file
-    run: |
-      if [ -f "target/dependency-check-report.html" ]; then
-        echo "SCA report generated successfully"
-        ls -la target/
-      else
-        echo "No SCA report found, checking target directory:"
-        find . -name "*.html" -type f
-      fi
-      
-  - name: Upload SCA report artifact
-    if: success() || failure()  # Загружаем даже при ошибке
-    uses: actions/upload-artifact@v4
-    with:
-      name: dependency-check-report
-      path: |
-        target/dependency-check-report.html
-        target/dependency-check-report.json
-        target/dependency-check-report.xml
-      retention-days: 7
+    - name: Run OWASP Dependency-Check with NVD API Key
+      env:
+        NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      run: |
+        echo "Running OWASP Dependency-Check SCA analysis with NVD API Key..."
+        echo "NVD API Key: ${NVD_API_KEY:0:8}..."  # Показываем только первые 8 символов
+        
+        # Запускаем проверку с API ключом
+        mvn org.owasp:dependency-check-maven:check \
+          -Dformat=HTML \
+          -DfailBuildOnCVSS=8 \
+          -DsuppressionFiles=dependency-check-suppressions.xml \
+          -DnvdApiKey=$NVD_API_KEY \
+          -DnvdApiDelay=6500 \
+          -DfailOnError=false
+        
+        echo "SCA analysis completed!"
+        
+    - name: Upload SCA report artifact
+      if: always()  # Загружаем даже при ошибке
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-check-report
+        path: |
+          target/dependency-check-report.html
+          target/dependency-check-report.json
+        retention-days: 7
