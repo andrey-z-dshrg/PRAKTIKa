@@ -68,17 +68,30 @@
 
     <build>
         <plugins>
-                 <plugin>
+                <plugin>
     <groupId>org.owasp</groupId>
     <artifactId>dependency-check-maven</artifactId>
     <version>9.0.9</version>
     <configuration>
-        <formats>HTML</formats>
-        <failBuildOnCVSS>11</failBuildOnCVSS> <!-- Отключаем fail на время тестирования -->
+        <formats>HTML,JSON,XML</formats>
+        <failBuildOnCVSS>8</failBuildOnCVSS>
         <suppressionFiles>
             <suppressionFile>dependency-check-suppressions.xml</suppressionFile>
         </suppressionFiles>
+        <!-- Настройки для NVD API -->
+        <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
+        <nvdApiUrl>https://services.nvd.nist.gov/rest/json/cves/2.0</nvdApiUrl>
+        <nvdApiDelay>6500</nvdApiDelay> <!-- Задержка между запросами (в мс) -->
+        <nvdApiMaxRetryCount>10</nvdApiMaxRetryCount>
+        <failOnError>false</failOnError> <!-- Не падать при ошибках -->
     </configuration>
+    <executions>
+        <execution>
+            <goals>
+                <goal>check</goal>
+            </goals>
+        </execution>
+    </executions>
 </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
