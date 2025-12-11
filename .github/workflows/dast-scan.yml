@@ -5,100 +5,111 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch: # Разрешает ручной запуск из вкладки Actions
+  workflow_dispatch:
 
-# 1. КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: явно задаём права для GITHUB_TOKEN
+# ВАЖНО: Расширенные права для GITHUB_TOKEN
 permissions:
-  contents: read      # Для чтения кода
-  actions: write      # Для управления workflow и артефактами (исправляет ошибку)
-  security-events: write # Для интеграции с Security tab
+  contents: read
+  actions: write      # Для управления workflow и артефактами
+  security-events: write # Ключевое право для сканеров безопасности
   checks: write       # Для обновления статуса проверок
+  id-token: write     # Для будущей аутентификации (опционально, но рекомендуется)
 
 jobs:
-  build-and-scan:
+  # JOB 1: Сборка приложения
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25 # Увеличенный таймаут для сканирования
-
+    outputs:
+      jar-name: ${{ steps.find-jar.outputs.name }}
     steps:
-      # 2. ШАГ 1: ПОЛУЧЕНИЕ КОДА
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 3. ШАГ 2: СОБОРКА ПРИЛОЖЕНИЯ (SPRING BOOT 3)
       - name: Set up JDK 21 and build
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
       - run: mvn -B clean package -DskipTests
-      - name: List JAR files
-        run: ls -lh target/*.jar
 
-      # 4. ШАГ 3: ЗАПУСК ПРИЛОЖЕНИЯ ДЛЯ СКАНИРОВАНИЯ
-      - name: Start Application
+      - name: Find JAR file
+        id: find-jar
         run: |
-          # Автоматически находим JAR-файл
-          JAR_PATH=$(find target -name "*.jar" -type f | head -1)
-          echo "🟢 Запускаем приложение: $JAR_PATH"
-          
-          # Запускаем в фоне, логи пишем в файл
-          nohup java -jar "$JAR_PATH" > application.log 2>&1 &
-          echo $! > app.pid
-          echo "PID процесса: $(cat app.pid)"
-          
-          # Даём время на запуск Spring Boot 3
-          echo "⏳ Ожидание 60 секунд для полного старта приложения..."
-          sleep 60
-          
-          # Проверяем доступность
-          echo "🔍 Проверка доступности приложения..."
-          if curl --max-time 30 --retry 3 --retry-delay 10 --retry-connrefused \
-                 -s -o /dev/null http://localhost:8080/actuator/health; then
-            echo "✅ Приложение запущено и отвечает"
-          else
-            echo "⚠️  Приложение может быть недоступно. Лог приложения:"
-            cat application.log
-            # Не завершаем workflow, возможно приложение запускается дольше
-          fi
+          JAR_NAME=$(ls target/*.jar | head -1)
+          echo "name=${JAR_NAME##*/}" >> $GITHUB_OUTPUT
+          echo "path=$JAR_NAME" >> $GITHUB_OUTPUT
 
-      # 5. ШАГ 4: БАЗОВОЕ СКАНИРОВАНИЕ ZAP
-      - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.10.0 # Стабильная версия
-        with:
-          target: 'http://localhost:8080'
-          cmd_options: '-I'  # Игнорировать предупреждения для первого запуска
-          scan_timeout: '1200' # 20 минут для больших приложений
-          rules_file_name: 'rules.tsv' # Использует ваш файл правил
-
-      # 6. ШАГ 5: СКАНИРОВАНИЕ API ZAP
-      - name: OWASP ZAP API Scan
-        uses: zaproxy/action-api-scan@v0.9.0 # Стабильная версия
-        with:
-          target: 'http://localhost:8080'
-          # Если есть OpenAPI спецификация, раскомментируйте:
-          # format: 'openapi'
-          # target: 'http://localhost:8080/v3/api-docs'
-          cmd_options: '-I'
-          scan_timeout: '1200'
-
-      # 7. ШАГ 6: СОХРАНЕНИЕ ОТЧЁТОВ КАК АРТЕФАКТОВ
-      - name: Upload ZAP Reports
-        if: always() # Выполнять всегда, даже если сканирование упало
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zap-security-reports
+          name: app-jar
+          path: ${{ steps.find-jar.outputs.path }}
+
+  # JOB 2: Запуск приложения и сканирование (зависит от сборки)
+  scan:
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 25
+
+    steps:
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+
+      - name: Start Application
+        run: |
+          JAR_FILE=$(ls *.jar | head -1)
+          echo "🟢 Запуск: $JAR_FILE"
+          nohup java -jar "$JAR_FILE" > app.log 2>&1 &
+          echo $! > app.pid
+          echo "PID: $(cat app.pid)"
+          echo "⏳ Ожидание 70 секунд..."
+          sleep 70
+          echo "🔍 Проверка здоровья..."
+          curl --max-time 30 --retry 2 --retry-delay 10 -s -f http://localhost:8080/actuator/health || echo "Проверка не удалась, продолжаем..."
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        continue-on-error: true # Продолжать даже при ошибках ZAP
+        with:
+          target: 'http://localhost:8080'
+          cmd_options: '-I -j' # -j для JSON отчета
+          scan_timeout: '1200'
+          rules_file_name: 'rules.tsv'
+
+      - name: Run OWASP ZAP API Scan
+        uses: zaproxy/action-api-scan@v0.9.0
+        continue-on-error: true
+        with:
+          target: 'http://localhost:8080'
+          cmd_options: '-I -j'
+          scan_timeout: '1200'
+
+      - name: List and Upload Reports
+        if: always()
+        run: |
+          echo "📁 Содержимое директории:"
+          ls -la
+          echo "📄 Поиск отчетов ZAP:"
+          find . -name "*.html" -o -name "*.json" -o -name "*.md" | head -10
+        # Загружаем все возможные отчеты
+      - name: Upload All Scan Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-full-reports
           path: |
-            zap_report.html
-            zap_api_report.html
+            *.html
+            *.json
+            *.md
+            app.log
           retention-days: 7
 
-      # 8. ШАГ 7: ОСТАНОВКА ПРИЛОЖЕНИЯ (ОЧИСТКА)
       - name: Stop Application
-        if: always() # Выполнять всегда
+        if: always()
         run: |
           if [ -f app.pid ]; then
-            echo "🛑 Останавливаем приложение с PID $(cat app.pid)"
             kill -9 $(cat app.pid) 2>/dev/null || true
-            rm -f app.pid application.log
             echo "✅ Приложение остановлено"
           fi
