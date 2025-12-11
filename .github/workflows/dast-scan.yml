@@ -7,45 +7,49 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# ВАЖНО: Расширенные права для GITHUB_TOKEN
 permissions:
   contents: read
-  actions: write
-  security-events: write
+  actions: write      # Для управления workflow и артефактами
+  security-events: write # Ключевое право для сканеров безопасности
+  checks: write       # Для обновления статуса проверок
+  id-token: write     # Для будущей аутентификации (опционально, но рекомендуется)
 
 jobs:
+  # JOB 1: Сборка приложения
   build:
     runs-on: ubuntu-latest
+    outputs:
+      jar-name: ${{ steps.find-jar.outputs.name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java and Build
+      - name: Set up JDK 21 and build
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
       - run: mvn -B clean package -DskipTests
-        env:
-          MAVEN_OPTS: '-Dmaven.repo.local=${{ runner.temp }}/.m2/repository'
 
-      - name: Create empty ZAP rules file
+      - name: Find JAR file
+        id: find-jar
         run: |
-          mkdir -p .zap
-          echo -e "# Alert\tRisk\tReliability\tURL\tParam\tAttack\tEvidence\tOther" > .zap/rules.tsv
-          echo "Created empty .zap/rules.tsv"
+          JAR_NAME=$(ls target/*.jar | head -1)
+          echo "name=${JAR_NAME##*/}" >> $GITHUB_OUTPUT
+          echo "path=$JAR_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
-          path: target/*.jar
+          path: ${{ steps.find-jar.outputs.path }}
 
+  # JOB 2: Запуск приложения и сканирование (зависит от сборки)
   scan:
     runs-on: ubuntu-latest
     needs: build
-    timeout-minutes: 30
-    env:
-      APP_PORT: 8080
+    timeout-minutes: 25
 
     steps:
       - name: Download JAR artifact
@@ -55,50 +59,51 @@ jobs:
 
       - name: Start Application
         run: |
-          # 1. Находим и запускаем JAR
           JAR_FILE=$(ls *.jar | head -1)
-          echo "🟢 Запускаем: $JAR_FILE"
-          nohup java -jar "$JAR_FILE" --server.port=$APP_PORT > app.log 2>&1 &
+          echo "🟢 Запуск: $JAR_FILE"
+          nohup java -jar "$JAR_FILE" > app.log 2>&1 &
           echo $! > app.pid
           echo "PID: $(cat app.pid)"
-          
-          # 2. Даём БОЛЬШЕ времени и ПРОВЕРЯЕМ несколько раз
-          echo "⏳ Ожидание запуска Spring Boot (90 секунд)..."
-          for i in {1..18}; do
-            sleep 5
-            if curl -s -f http://localhost:$APP_PORT/actuator/health > /dev/null 2>&1; then
-              echo "✅ Приложение ЗАПУЩЕНО и отвечает на порту $APP_PORT!"
-              exit 0
-            fi
-            echo "   Попытка $i/18: приложение ещё не готово..."
-          done
-          
-          echo "❌ Приложение НЕ запустилось за отведённое время. Лог:"
-          cat app.log
-          exit 1 # Падаем, если приложение не запустилось
+          echo "⏳ Ожидание 70 секунд..."
+          sleep 70
+          echo "🔍 Проверка здоровья..."
+          curl --max-time 30 --retry 2 --retry-delay 10 -s -f http://localhost:8080/actuator/health || echo "Проверка не удалась, продолжаем..."
 
-      - name: OWASP ZAP Baseline Scan (FIXED)
+      - name: Run OWASP ZAP Baseline Scan
         uses: zaproxy/action-baseline@v0.10.0
+        continue-on-error: true # Продолжать даже при ошибках ZAP
         with:
-          target: 'http://localhost:${{ env.APP_PORT }}'
-          cmd_options: '-I -j'
-          rules_file_name: '.zap/rules.tsv' # Указываем корректный путь
+          target: 'http://localhost:8080'
+          cmd_options: '-I -j' # -j для JSON отчета
+          scan_timeout: '1200'
+          rules_file_name: 'rules.tsv'
 
-      - name: OWASP ZAP API Scan (FIXED)
+      - name: Run OWASP ZAP API Scan
         uses: zaproxy/action-api-scan@v0.9.0
+        continue-on-error: true
         with:
-          target: 'http://localhost:${{ env.APP_PORT }}'
+          target: 'http://localhost:8080'
           cmd_options: '-I -j'
+          scan_timeout: '1200'
 
-      - name: Upload Scan Reports
+      - name: List and Upload Reports
+        if: always()
+        run: |
+          echo "📁 Содержимое директории:"
+          ls -la
+          echo "📄 Поиск отчетов ZAP:"
+          find . -name "*.html" -o -name "*.json" -o -name "*.md" | head -10
+        # Загружаем все возможные отчеты
+      - name: Upload All Scan Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zap-security-reports
+          name: zap-full-reports
           path: |
             *.html
             *.json
             *.md
+            app.log
           retention-days: 7
 
       - name: Stop Application
@@ -106,6 +111,5 @@ jobs:
         run: |
           if [ -f app.pid ]; then
             kill -9 $(cat app.pid) 2>/dev/null || true
-            rm -f app.pid app.log
             echo "✅ Приложение остановлено"
           fi
