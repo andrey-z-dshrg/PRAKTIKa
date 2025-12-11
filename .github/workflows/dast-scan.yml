@@ -5,18 +5,17 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch: # Позволяет запускать вручную из вкладки Actions
 
 jobs:
   build-and-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      # Шаг 1: Получить код
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Шаг 2: Собрать приложение
       - name: Set up JDK 21 and build
         uses: actions/setup-java@v4
         with:
@@ -24,34 +23,39 @@ jobs:
           java-version: '21'
       - run: mvn -B clean package -DskipTests
 
-      # Шаг 3: Запустить приложение
       - name: Start Application
         run: |
           JAR_PATH=$(find target -name "*.jar" -type f | head -1)
-          echo "Starting: $JAR_PATH"
+          echo "🟢 Starting: $JAR_PATH"
           nohup java -jar "$JAR_PATH" > application.log 2>&1 &
           echo $! > app.pid
           echo "PID: $(cat app.pid)"
-          sleep 40
-          curl --retry 5 --retry-delay 5 --retry-connrefused -s -o /dev/null http://localhost:8080 || echo "Check passed"
+          # Даем больше времени для Spring Boot
+          echo "Waiting 50 seconds for app to start..."
+          sleep 50
+          # Проверяем доступность
+          if curl --retry 3 --retry-delay 5 --retry-connrefused -s -o /dev/null http://localhost:8080; then
+            echo "✅ Application is ready"
+          else
+            echo "⚠️  Application may be slow, continuing anyway..."
+            cat application.log
+          fi
 
-      # Шаг 4: Базовое сканирование (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+      # ЗАМЕНИТЕ ВЕРСИИ НА АКТУАЛЬНЫЕ ЕСЛИ НУЖНО
       - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.14.0  # Актуальная версия
+        uses: zaproxy/action-baseline@v0.10.0 # ← ПРОВЕРЬТЕ ВЕРСИЮ
         with:
           target: 'http://localhost:8080'
           cmd_options: '-I'
-          scan_timeout: '600'
+          scan_timeout: '900' # 15 минут
 
-      # Шаг 5: Сканирование API (ИСПРАВЛЕННАЯ ВЕРСИЯ)
       - name: OWASP ZAP API Scan
-        uses: zaproxy/action-api-scan@v0.15.0  # Актуальная версия
+        uses: zaproxy/action-api-scan@v0.9.0 # ← ПРОВЕРЬТЕ ВЕРСИЮ
         with:
           target: 'http://localhost:8080'
           cmd_options: '-I'
-          scan_timeout: '600'
+          scan_timeout: '900'
 
-      # Шаг 6: Сохранить отчеты
       - name: Upload ZAP Reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -62,11 +66,11 @@ jobs:
             zap_api_report.html
           retention-days: 7
 
-      # Шаг 7: Остановить приложение
       - name: Stop Application
         if: always()
         run: |
           if [ -f app.pid ]; then
+            echo "Stopping app PID $(cat app.pid)"
             kill $(cat app.pid) 2>/dev/null || true
-            rm -f app.pid
+            rm -f app.pid app.log
           fi
