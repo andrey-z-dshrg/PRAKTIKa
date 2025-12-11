@@ -5,59 +5,85 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch: # Позволяет запускать вручную из вкладки Actions
+  workflow_dispatch: # Разрешает ручной запуск из вкладки Actions
+
+# 1. КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: явно задаём права для GITHUB_TOKEN
+permissions:
+  contents: read      # Для чтения кода
+  actions: write      # Для управления workflow и артефактами (исправляет ошибку)
+  security-events: write # Для интеграции с Security tab
+  checks: write       # Для обновления статуса проверок
 
 jobs:
   build-and-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25 # Увеличенный таймаут для сканирования
 
     steps:
+      # 2. ШАГ 1: ПОЛУЧЕНИЕ КОДА
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 3. ШАГ 2: СОБОРКА ПРИЛОЖЕНИЯ (SPRING BOOT 3)
       - name: Set up JDK 21 and build
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
       - run: mvn -B clean package -DskipTests
+      - name: List JAR files
+        run: ls -lh target/*.jar
 
+      # 4. ШАГ 3: ЗАПУСК ПРИЛОЖЕНИЯ ДЛЯ СКАНИРОВАНИЯ
       - name: Start Application
         run: |
+          # Автоматически находим JAR-файл
           JAR_PATH=$(find target -name "*.jar" -type f | head -1)
-          echo "🟢 Starting: $JAR_PATH"
+          echo "🟢 Запускаем приложение: $JAR_PATH"
+          
+          # Запускаем в фоне, логи пишем в файл
           nohup java -jar "$JAR_PATH" > application.log 2>&1 &
           echo $! > app.pid
-          echo "PID: $(cat app.pid)"
-          # Даем больше времени для Spring Boot
-          echo "Waiting 50 seconds for app to start..."
-          sleep 50
+          echo "PID процесса: $(cat app.pid)"
+          
+          # Даём время на запуск Spring Boot 3
+          echo "⏳ Ожидание 60 секунд для полного старта приложения..."
+          sleep 60
+          
           # Проверяем доступность
-          if curl --retry 3 --retry-delay 5 --retry-connrefused -s -o /dev/null http://localhost:8080; then
-            echo "✅ Application is ready"
+          echo "🔍 Проверка доступности приложения..."
+          if curl --max-time 30 --retry 3 --retry-delay 10 --retry-connrefused \
+                 -s -o /dev/null http://localhost:8080/actuator/health; then
+            echo "✅ Приложение запущено и отвечает"
           else
-            echo "⚠️  Application may be slow, continuing anyway..."
+            echo "⚠️  Приложение может быть недоступно. Лог приложения:"
             cat application.log
+            # Не завершаем workflow, возможно приложение запускается дольше
           fi
 
-      # ЗАМЕНИТЕ ВЕРСИИ НА АКТУАЛЬНЫЕ ЕСЛИ НУЖНО
+      # 5. ШАГ 4: БАЗОВОЕ СКАНИРОВАНИЕ ZAP
       - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.10.0 # ← ПРОВЕРЬТЕ ВЕРСИЮ
+        uses: zaproxy/action-baseline@v0.10.0 # Стабильная версия
         with:
           target: 'http://localhost:8080'
-          cmd_options: '-I'
-          scan_timeout: '900' # 15 минут
+          cmd_options: '-I'  # Игнорировать предупреждения для первого запуска
+          scan_timeout: '1200' # 20 минут для больших приложений
+          rules_file_name: 'rules.tsv' # Использует ваш файл правил
 
+      # 6. ШАГ 5: СКАНИРОВАНИЕ API ZAP
       - name: OWASP ZAP API Scan
-        uses: zaproxy/action-api-scan@v0.9.0 # ← ПРОВЕРЬТЕ ВЕРСИЮ
+        uses: zaproxy/action-api-scan@v0.9.0 # Стабильная версия
         with:
           target: 'http://localhost:8080'
+          # Если есть OpenAPI спецификация, раскомментируйте:
+          # format: 'openapi'
+          # target: 'http://localhost:8080/v3/api-docs'
           cmd_options: '-I'
-          scan_timeout: '900'
+          scan_timeout: '1200'
 
+      # 7. ШАГ 6: СОХРАНЕНИЕ ОТЧЁТОВ КАК АРТЕФАКТОВ
       - name: Upload ZAP Reports
-        if: always()
+        if: always() # Выполнять всегда, даже если сканирование упало
         uses: actions/upload-artifact@v4
         with:
           name: zap-security-reports
@@ -66,11 +92,13 @@ jobs:
             zap_api_report.html
           retention-days: 7
 
+      # 8. ШАГ 7: ОСТАНОВКА ПРИЛОЖЕНИЯ (ОЧИСТКА)
       - name: Stop Application
-        if: always()
+        if: always() # Выполнять всегда
         run: |
           if [ -f app.pid ]; then
-            echo "Stopping app PID $(cat app.pid)"
-            kill $(cat app.pid) 2>/dev/null || true
-            rm -f app.pid app.log
+            echo "🛑 Останавливаем приложение с PID $(cat app.pid)"
+            kill -9 $(cat app.pid) 2>/dev/null || true
+            rm -f app.pid application.log
+            echo "✅ Приложение остановлено"
           fi
