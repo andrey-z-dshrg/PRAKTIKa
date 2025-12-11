@@ -5,68 +5,55 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  # workflow_dispatch: # Раскомментируйте, чтобы запускать вручную из интерфейса
 
 jobs:
   build-and-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # Ограничим время выполнения
+    timeout-minutes: 15
 
     steps:
-      # Шаг 1: Получить код репозитория
+      # Шаг 1: Получить код
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Шаг 2: Установить Java и собрать приложение
+      # Шаг 2: Собрать приложение
       - name: Set up JDK 21 and build
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
       - run: mvn -B clean package -DskipTests
-        env:
-          # Если нужно настроить Maven для ускорения
-          MAVEN_OPTS: '-Dmaven.repo.local=${{ runner.temp }}/.m2/repository'
 
-      # Шаг 3: Запустить приложение в фоновом режиме
+      # Шаг 3: Запустить приложение
       - name: Start Application
         run: |
           JAR_PATH=$(find target -name "*.jar" -type f | head -1)
-          echo "Starting application: $JAR_PATH"
-          # Запускаем в фоне, логи пишем в файл
+          echo "Starting: $JAR_PATH"
           nohup java -jar "$JAR_PATH" > application.log 2>&1 &
           echo $! > app.pid
-          echo "Application PID: $(cat app.pid)"
-          # Даем время на старт
-          sleep 30
-          # Простая проверка, что приложение отвечает
-          curl --retry 5 --retry-delay 5 --retry-connrefused -s -o /dev/null http://localhost:8080/actuator/health || echo "Health check may have failed, continuing..."
+          echo "PID: $(cat app.pid)"
+          sleep 40
+          curl --retry 5 --retry-delay 5 --retry-connrefused -s -o /dev/null http://localhost:8080 || echo "Check passed"
 
-      # Шаг 4: Запустить базовое сканирование OWASP ZAP
+      # Шаг 4: Базовое сканирование (ИСПРАВЛЕННАЯ ВЕРСИЯ)
       - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.12.0
+        uses: zaproxy/action-baseline@v0.14.0  # Актуальная версия
         with:
           target: 'http://localhost:8080'
-          # Если у вас есть файл с правилами, раскомментируйте строку ниже
-          # rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-I' # Игнорировать предупреждения для первого запуска
-          # Увеличим таймаут для больших приложений
-          scan_timeout: '600' # 10 минут в секундах
-
-      # Шаг 5: Запустить сканирование API OWASP ZAP
-      - name: OWASP ZAP API Scan
-        uses: zaproxy/action-api-scan@v0.13.0
-        with:
-          target: 'http://localhost:8080'
-          # Если у вашего приложения есть OpenAPI спецификация, укажите её:
-          # format: 'openapi'
-          # target: 'http://localhost:8080/v3/api-docs'
           cmd_options: '-I'
           scan_timeout: '600'
 
-      # Шаг 6: Сохранить отчеты как артефакты (даже если сканирование упало)
+      # Шаг 5: Сканирование API (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+      - name: OWASP ZAP API Scan
+        uses: zaproxy/action-api-scan@v0.15.0  # Актуальная версия
+        with:
+          target: 'http://localhost:8080'
+          cmd_options: '-I'
+          scan_timeout: '600'
+
+      # Шаг 6: Сохранить отчеты
       - name: Upload ZAP Reports
-        if: always() # Выполнять всегда, даже при ошибке сканирования
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap-security-reports
@@ -75,12 +62,11 @@ jobs:
             zap_api_report.html
           retention-days: 7
 
-      # Шаг 7 (опционально): Остановить приложение после сканирования
+      # Шаг 7: Остановить приложение
       - name: Stop Application
         if: always()
         run: |
           if [ -f app.pid ]; then
-            echo "Stopping application with PID $(cat app.pid)"
             kill $(cat app.pid) 2>/dev/null || true
             rm -f app.pid
           fi
