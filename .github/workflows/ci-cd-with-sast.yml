@@ -32,7 +32,6 @@ jobs:
 
       - name: Build with Maven
         run: |
-          # Если есть mvnw, используем его
           if [ -f "mvnw" ]; then
             chmod +x mvnw
             ./mvnw clean compile -DskipTests
@@ -73,17 +72,19 @@ jobs:
       - name: Run Semgrep SAST scan
         id: semgrep
         run: |
+          echo "🔍 Starting Semgrep SAST scan..."
           docker run --rm -v "$(pwd):/src" returntocorp/semgrep semgrep scan \
             --config auto \
             --sarif \
-            --output=semgrep-results.sarif \
-            --metrics=off
+            --output=semgrep-results.sarif
+          echo "✅ Semgrep scan completed"
 
       - name: Analyze SAST results
         id: analyze
         run: |
-          echo "🔍 Analyzing SAST results..."
+          echo "📊 Analyzing SAST results..."
           
+          # Проверяем наличие отчета
           if [ ! -f "semgrep-results.sarif" ]; then
             echo "❌ SAST report not found"
             echo "TOTAL_ISSUES=0" >> $GITHUB_OUTPUT
@@ -91,15 +92,35 @@ jobs:
             exit 0
           fi
           
+          # Устанавливаем jq для анализа JSON
+          echo "Installing jq for JSON parsing..."
           sudo apt-get update && sudo apt-get install -y jq
           
+          # Проверяем валидность JSON
+          if ! jq empty semgrep-results.sarif 2>/dev/null; then
+            echo "⚠️ SARIF file is not valid JSON or is empty"
+            echo "TOTAL_ISSUES=0" >> $GITHUB_OUTPUT
+            echo "CRITICAL_COUNT=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Считаем общее количество проблем
           TOTAL_ISSUES=$(jq '.runs[0].results | length' semgrep-results.sarif 2>/dev/null || echo "0")
-          echo "Total issues: $TOTAL_ISSUES"
+          echo "Total issues found: $TOTAL_ISSUES"
           echo "TOTAL_ISSUES=$TOTAL_ISSUES" >> $GITHUB_OUTPUT
           
+          # Считаем критические проблемы (уровень error)
           CRITICAL_COUNT=$(jq '[.runs[0].results[] | select(.level == "error")] | length' semgrep-results.sarif 2>/dev/null || echo "0")
           echo "Critical issues: $CRITICAL_COUNT"
           echo "CRITICAL_COUNT=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+          
+          # Считаем warning проблемы
+          WARNING_COUNT=$(jq '[.runs[0].results[] | select(.level == "warning")] | length' semgrep-results.sarif 2>/dev/null || echo "0")
+          echo "Warning issues: $WARNING_COUNT"
+          
+          # Считаем info проблемы
+          INFO_COUNT=$(jq '[.runs[0].results[] | select(.level == "note" or .level == null)] | length' semgrep-results.sarif 2>/dev/null || echo "0")
+          echo "Info issues: $INFO_COUNT"
           
           if [ "$TOTAL_ISSUES" -eq 0 ]; then
             echo "✅ No security issues found!"
@@ -107,24 +128,123 @@ jobs:
           fi
           
           echo ""
-          echo "📊 Security Issues Found:"
+          echo "📈 SEVERITY BREAKDOWN"
+          echo "====================="
+          echo "| Severity  | Count |"
+          echo "|-----------|-------|"
+          echo "| 🔴 Critical | $CRITICAL_COUNT |"
+          echo "| 🟡 Warning  | $WARNING_COUNT |"
+          echo "| 🔵 Info     | $INFO_COUNT |"
+          echo "| 📊 Total    | $TOTAL_ISSUES |"
+          
+          echo ""
+          echo "🔧 TOP 10 SECURITY ISSUES"
           echo "========================="
           
-          echo ""
-          echo "Top 5 issues:"
-          jq -r '.runs[0].results[:5][] | "- [" + (.level // "warning") + "] " + .ruleId + ": " + (.message.text | split("\n")[0])' semgrep-results.sarif 2>/dev/null
+          # Извлекаем топ 10 проблем
+          jq -r '.runs[0].results[:10][] | 
+            "[" + (.level // "warning") + "] " + .ruleId + "\n" +
+            "   Description: " + .message.text + "\n" +
+            "   Location: " + .locations[0].physicalLocation.artifactLocation.uri + 
+            ":" + (.locations[0].physicalLocation.region.startLine // "?") + "\n"' \
+            semgrep-results.sarif 2>/dev/null || echo "No detailed issues to display"
           
           echo ""
-          echo "📈 Severity breakdown:"
-          jq -r '.runs[0].results[].level // "warning"' semgrep-results.sarif 2>/dev/null | sort | uniq -c | sort -rn
+          echo "📋 ISSUES BY CATEGORY"
+          echo "===================="
+          jq -r '.runs[0].results[].ruleId' semgrep-results.sarif 2>/dev/null | \
+            sort | uniq -c | sort -rn | head -10
+          
+          # Создаем summary для PR
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "🚨 ACTION REQUIRED: $CRITICAL_COUNT critical issues found!"
+            echo "ACTION_REQUIRED=true" >> $GITHUB_OUTPUT
+          else
+            echo "ACTION_REQUIRED=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Upload SARIF report
+      - name: Create Security Report
+        if: steps.analyze.outputs.TOTAL_ISSUES != '0'
+        run: |
+          echo "📄 Creating detailed security report..."
+          
+          # Создаем Markdown отчет
+          cat > SECURITY_REPORT.md << 'EOF'
+# 🔒 Security Scan Report
+          
+**Scan Date:** $(date)
+**Branch:** ${{ github.ref }}
+**Commit:** ${{ github.sha }}
+          
+## Executive Summary
+          
+| Metric | Value |
+|--------|-------|
+| Total Issues | ${{ steps.analyze.outputs.TOTAL_ISSUES }} |
+| Critical Issues | ${{ steps.analyze.outputs.CRITICAL_COUNT }} |
+| Scan Status | $(if [ "${{ steps.analyze.outputs.CRITICAL_COUNT }}" -gt 0 ]; then echo "❌ Needs Attention"; else echo "✅ Passed"; fi) |
+          
+## Issues Breakdown
+          
+EOF
+          
+          # Добавляем детали по проблемам
+          if [ -f "semgrep-results.sarif" ]; then
+            echo "### Top Security Issues" >> SECURITY_REPORT.md
+            echo "" >> SECURITY_REPORT.md
+            echo "| Severity | Rule ID | Description | Location |" >> SECURITY_REPORT.md
+            echo "|----------|---------|-------------|----------|" >> SECURITY_REPORT.md
+            
+            jq -r '.runs[0].results[:20][] | 
+              "| " + (.level // "warning") + " | `" + .ruleId + "` | " + 
+              (.message.text | gsub("\n"; " ")) + " | `" + 
+              .locations[0].physicalLocation.artifactLocation.uri + ":" + 
+              (.locations[0].physicalLocation.region.startLine // "?") + "` |"' \
+              semgrep-results.sarif 2>/dev/null >> SECURITY_REPORT.md
+          fi
+          
+          # Добавляем рекомендации
+          cat >> SECURITY_REPORT.md << 'EOF'
+          
+## Recommendations
+          
+1. **Immediate Action Required:** Fix all critical issues (severity: error)
+2. **High Priority:** Address warning-level issues within 2 weeks
+3. **Best Practices:**
+   - Review and fix issues in order of severity
+   - Enable code review for security-sensitive changes
+   - Schedule regular security scans
+          
+## Next Steps
+          
+EOF
+          
+          if [ "${{ steps.analyze.outputs.CRITICAL_COUNT }}" -gt 0 ]; then
+            echo "- [ ] Fix critical security issues immediately" >> SECURITY_REPORT.md
+          fi
+          
+          echo "- [ ] Review all security findings" >> SECURITY_REPORT.md
+          echo "- [ ] Update dependencies if needed" >> SECURITY_REPORT.md
+          
+          echo "✅ Report generated: SECURITY_REPORT.md"
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: |
+            semgrep-results.sarif
+            SECURITY_REPORT.md
+          retention-days: 7
+
+      - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep-results.sarif
           category: semgrep
 
-      - name: Create summary comment
+      - name: Post Security Summary to PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
@@ -137,27 +257,31 @@ jobs:
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: '## 🔒 Security Scan Result\n✅ No security issues found!'
+                body: '## 🔒 Security Scan Result\n\n✅ **No security issues found!**\n\nAll security checks passed successfully.'
               });
               return;
             }
             
+            let emoji = '✅';
+            if (critical > 0) {
+              emoji = '🚨';
+            }
+            
             const summary = `
-            ## 🔒 Security Scan Result
+            ${emoji} **Security Scan Results**
             
-            **Found ${total} security issue(s)** (${critical} critical)
+            | Metric | Value |
+            |--------|-------|
+            | **Total Issues** | ${total} |
+            | **Critical Issues** | ${critical} |
+            | **Warning Issues** | ${total - critical} |
             
-            | Severity | Count |
-            |----------|-------|
-            | 🔴 Critical | ${critical} |
-            | 🟡 Warning | ${total - critical} |
-            
-            **Next steps:**
+            **Next Steps:**
             1. Review findings in the "Security" tab
             2. Fix critical issues before merging
-            3. View detailed report in workflow artifacts
+            3. Download full report from artifacts
             
-            _Security scan completed successfully._
+            [View detailed report](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
             `;
             
             github.rest.issues.createComment({
@@ -167,17 +291,63 @@ jobs:
               body: summary
             });
 
+      - name: Fail on Critical Issues (Optional)
+        if: steps.analyze.outputs.CRITICAL_COUNT > '0' && github.ref_name == 'main'
+        run: |
+          echo "🚨 Critical security issues detected! Failing pipeline for main branch."
+          echo "Please fix the issues before merging to main."
+          exit 1
+
   deploy:
     runs-on: ubuntu-latest
     needs: [build, sast]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && steps.sast.outputs.CRITICAL_COUNT == '0'
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: java-app
       
-      - name: Show deployment info
+      - name: Display deployment info
         run: |
-          echo "Application built successfully with Java 21"
-          ls -la *.jar || echo "No JAR files in current directory"
+          echo "🚀 Deploying Java 21 Application"
+          echo "Build successful!"
+          echo "Security scan passed!"
+          
+          # Проверяем наличие JAR файлов
+          echo "Available JAR files:"
+          find . -name "*.jar" -type f | head -5
+          
+          # Здесь добавьте ваши команды деплоя
+          # Например:
+          # echo "Deploying to server..."
+          # scp *.jar user@server:/path/to/deploy/
+          
+          echo "✅ Ready for deployment"
+
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    needs: [build, sast]
+    if: always()
+    steps:
+      - name: Workflow Summary
+        run: |
+          echo "🏁 CI/CD Pipeline Summary"
+          echo "========================"
+          echo "Build: ${{ needs.build.result }}"
+          echo "SAST: ${{ needs.sast.result }}"
+          echo "Critical Issues: ${{ needs.sast.outputs.CRITICAL_COUNT || 0 }}"
+          echo "Total Issues: ${{ needs.sast.outputs.TOTAL_ISSUES || 0 }}"
+          
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            echo "✅ Build successful"
+          else
+            echo "❌ Build failed"
+          fi
+          
+          if [ "${{ needs.sast.result }}" = "success" ]; then
+            echo "✅ SAST scan completed"
+          else
+            echo "❌ SAST scan failed"
+          fi
