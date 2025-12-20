@@ -1,0 +1,4 @@
+# Исключения для ZAP сканирования
+# Формат: RuleId<TAB>Scope<TAB>URL<TAB>Reason
+40012	INCLUDE	http://localhost:8080/api/test	False positive - test endpoint
+40018	INCLUDE	http://localhost:8080/admin/*	Admin endpoints require auth
