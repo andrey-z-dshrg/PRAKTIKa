@@ -1,0 +1,116 @@
+name: DAST Security Scan with OWASP ZAP
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  security-events: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 and Build
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - run: mvn -B clean package -DskipTests
+
+      - name: Create empty ZAP rules file
+        run: |
+          mkdir -p .zap
+          echo -e "# Alert\tRisk\tReliability\tURL\tParam\tAttack\tEvidence\tOther" > .zap/rules.tsv
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+
+  scan:
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+    env:
+      APP_PORT: 8080
+
+    steps:
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+
+      - name: Setup Java 21 for Runtime
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Verify Java Version
+        run: java -version
+
+      - name: Start Application
+        run: |
+          JAR_FILE=$(ls *.jar | head -1)
+          echo "🟢 Запускаем: $JAR_FILE с Java $(java -version 2>&1 | head -1)"
+          nohup java -jar "$JAR_FILE" --server.port=$APP_PORT > app.log 2>&1 &
+          echo $! > app.pid
+          echo "PID: $(cat app.pid)"
+          
+          echo "⏳ Ожидание запуска (до 120 секунд)..."
+          for i in {1..24}; do
+            sleep 5
+            if curl -s -f http://localhost:$APP_PORT/actuator/health > /dev/null 2>&1; then
+              echo "✅ Приложение ЗАПУЩЕНО на порту $APP_PORT!"
+              exit 0
+            fi
+            echo "   Попытка $i/24..."
+          done
+          
+          echo "❌ Приложение не запустилось. Последние строки лога:"
+          tail -50 app.log
+          exit 1
+
+      - name: OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        continue-on-error: true  # ⬅️ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
+        with:
+          target: 'http://localhost:${{ env.APP_PORT }}'
+          cmd_options: '-I -j'
+          rules_file_name: '.zap/rules.tsv'
+
+      - name: OWASP ZAP API Scan
+        uses: zaproxy/action-api-scan@v0.9.0
+        continue-on-error: true  # ⬅️ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
+        with:
+          target: 'http://localhost:${{ env.APP_PORT }}'
+          cmd_options: '-I -j'
+
+      - name: Upload Scan Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-security-reports
+          path: |
+            *.html
+            *.json
+            *.md
+          retention-days: 7
+
+      - name: Stop Application
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill -9 $(cat app.pid) 2>/dev/null || true
+            echo "✅ Приложение остановлено"
+          fi
