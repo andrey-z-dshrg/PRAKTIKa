@@ -1,11 +1,5 @@
 name: Java CI with Maven and Security
 
-on:
-  pull_request:
-    branches: [ "main" ]
-  push:
-    branches: [ "main" ]
-
 # Разрешаем доступ к секретам для workflow
 permissions:
   contents: read
