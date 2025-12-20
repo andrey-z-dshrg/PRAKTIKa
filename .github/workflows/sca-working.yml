@@ -1,72 +1,171 @@
-name: Java CI with Maven
+name: Security Fuzzing Tests
 
-
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:  # Ручной запуск
 
 jobs:
   build:
     runs-on: ubuntu-latest
     container: maven:3.9-eclipse-temurin-21
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+      
       - name: Build with Maven
         run: mvn clean package -DskipTests
-
+      
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: course-management-jar
+          name: app-jar
           path: target/*.jar
-          retention-days: 5
 
-  sast:
-    needs: build
+  deploy-and-fuzz:
     runs-on: ubuntu-latest
+    needs: build
     permissions:
       security-events: write
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
         with:
-          python-version: '3.x'
-
-      - name: Install Semgrep
-        run: pip install semgrep
-
-      - name: Semgrep Security Scan
-        run: semgrep --config p/default --sarif --output=semgrep.sarif
-
-      - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: semgrep.sarif
-        if: always()
-
-  dependency-scan:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
+          name: app-jar
+      
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
           distribution: 'temurin'
-          cache: maven
-
-      - name: OWASP Dependency Check
-        run: mvn org.owasp:dependency-check-maven:check
-
-      - name: Upload Dependency Check Report
-        uses: actions/upload-artifact@v4
-        if: always()
+          java-version: '21'
+      
+      - name: Start test application
+        run: |
+          echo "Starting test application..."
+          nohup java -jar *.jar --server.port=8080 > app.log 2>&1 &
+          echo $! > app.pid
+          
+          # Wait for app to start
+          timeout=60
+          while ! curl -s http://localhost:8080/actuator/health > /dev/null; do
+            sleep 2
+            timeout=$((timeout-2))
+            if [ $timeout -le 0 ]; then
+              echo "Application failed to start"
+              exit 1
+            fi
+          done
+          echo "Application is running"
+      
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
         with:
-          name: dependency-check-report
-          path: target/dependency-check-report.html
+          target: 'http://localhost:8080'
+          token: ${{ secrets.GITHUB_TOKEN }}
+          cmd_options: '-a'
+          rules_file_name: '.zap/rules.tsv'
+          allow_issue_writing: true
+      
+      - name: Run ZAP Full Scan with Fuzzing
+        run: |
+          echo "🔍 Starting ZAP full scan with fuzzing..."
+          
+          # Pull ZAP docker image
+          docker pull owasp/zap2docker-stable:latest
+          
+          # Run ZAP with API
+          docker run -u zap -p 8081:8081 \
+            -d owasp/zap2docker-stable:latest \
+            zap.sh -daemon -host 0.0.0.0 -port 8081 \
+            -config api.disablekey=true \
+            -config api.addrs.addr.name=.* \
+            -config api.addrs.addr.regex=true
+          
+          sleep 10
+          
+          # Run spider
+          curl "http://localhost:8081/JSON/spider/action/scan/?url=http://localhost:8080&maxChildren=10"
+          sleep 30
+          
+          # Run active scan (includes fuzzing)
+          curl "http://localhost:8081/JSON/ascan/action/scan/?url=http://localhost:8080&recurse=true&scanPolicyName=Default%20Policy"
+          
+          # Wait for scan to complete
+          while true; do
+            STATUS=$(curl -s "http://localhost:8081/JSON/ascan/view/status/?scanId=0" | jq -r '.status')
+            echo "Scan progress: $STATUS%"
+            if [ "$STATUS" = "100" ]; then
+              break
+            fi
+            sleep 10
+          done
+          
+          # Generate reports
+          curl -s "http://localhost:8081/OTHER/core/other/htmlreport/" > zap-full-report.html
+          curl -s "http://localhost:8081/JSON/core/view/alerts/?baseurl=http://localhost:8080" > zap-alerts.json
+          
+          # Stop ZAP container
+          docker stop $(docker ps -q --filter ancestor=owasp/zap2docker-stable:latest)
+      
+      - name: Run Custom Fuzzing with Nuclei
+        run: |
+          echo "Running nuclei fuzzing templates..."
+          
+          # Install nuclei
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          
+          # Run nuclei with fuzzing templates
+          /go/bin/nuclei -u http://localhost:8080 \
+            -t ~/nuclei-templates/ \
+            -severity medium,high,critical \
+            -timeout 30 \
+            -o nuclei-report.json \
+            -json
+          
+          # Check for critical findings
+          if [ -f nuclei-report.json ]; then
+            CRITICAL_COUNT=$(jq 'select(.severity == "critical") | length' nuclei-report.json 2>/dev/null || echo "0")
+            if [ "$CRITICAL_COUNT" -gt "0" ]; then
+              echo "Critical vulnerabilities found!"
+              exit 1
+            fi
+          fi
+      
+      - name: Run API Fuzzing with Schemathesis
+        if: false  # Опционально, если есть OpenAPI спецификация
+        run: |
+          echo "Running API fuzzing with Schemathesis..."
+          pip install schemathesis
+          
+          # Если есть OpenAPI спецификация
+          if [ -f "src/main/resources/openapi.yaml" ]; then
+            schemathesis run \
+              --checks all \
+              --stateful=links \
+              src/main/resources/openapi.yaml \
+              --base-url=http://localhost:8080 \
+              --report=junit.xml
+          fi
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-reports
+          path: |
+            zap-full-report.html
+            zap-alerts.json
+            nuclei-report.json
+          retention-days: 7
+        if: always()
+      
+      - name: Stop test application
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill $(cat app.pid) 2>/dev/null || true
+          fi
