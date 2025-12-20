@@ -1,0 +1,41 @@
+# Конфигурация OWASP ZAP для CI/CD
+env:
+  rules:
+    # Настройка правил фаззинга
+    - section: rule.fuzz
+      key: fuzzDir
+      value: "/zap/wrk/fuzzers"
+      description: "Директория с фаззерами"
+    
+    - section: rule.fuzz
+      key: fuzzers
+      value: "Blind SQL Injection,Cross Site Scripting,LDAP Injection"
+      description: "Активные фаззеры"
+
+  scripts:
+    # Включение скриптов для фаззинга
+    - name: "Fuzzer HTTP Processor"
+      engine: "ECMAScript"
+      type: "httpsender"
+      file: "/zap/scripts/templates/fuzzerprocessor.js"
+      enabled: true
+
+  policies:
+    # Политика сканирования
+    - name: "Default Policy"
+      default: true
+      rules:
+        - id: 40012  # Cross Site Scripting
+          threshold: "MEDIUM"
+          
+        - id: 40018  # SQL Injection
+          threshold: "MEDIUM"
+          
+        - id: 40026  # OS Command Injection
+          threshold: "MEDIUM"
+          
+        - id: 40027  # LDAP Injection
+          threshold: "MEDIUM"
+          
+        - id: 90019  # Insecure HTTP Method
+          threshold: "LOW"
